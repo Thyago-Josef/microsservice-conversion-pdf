@@ -2,3 +2,6 @@ flask
 docling
 pymupdf
 python-docx
+pdf2docx
+Pillow
+pytesseract
