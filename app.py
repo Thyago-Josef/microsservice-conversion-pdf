@@ -219,7 +219,117 @@ def extract_icon_images_from_pdf(pdf_path):
 #         import traceback
 #         traceback.print_exc()
 
+def split_merged_paragraphs(docx_path):
+    """
+    Quebra parágrafos que contêm múltiplos bullets num único <w:p>
+    Trata dois casos:
+    1. Bullets separados por <w:br/> 
+    2. Bullets concatenados no mesmo <w:r> ou em <w:r> consecutivos
+    """
+    from copy import deepcopy
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
 
+    doc = Document(docx_path)
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    for para in list(doc.paragraphs):
+        p_elem = para._p
+        runs = p_elem.findall(f'{{{W}}}r')
+
+        if not runs:
+            continue
+
+        # Verifica se tem <w:br/> ou múltiplos bullets (•) nos runs
+        has_br = any(r.find(f'{{{W}}}br') is not None for r in runs)
+        full_text = para.text
+        bullet_count = full_text.count('•')
+
+        if not has_br and bullet_count <= 1:
+            continue
+
+        print(f"  Quebrando: '{full_text[:60]}...'")
+
+        parent = p_elem.getparent()
+        insert_pos = list(parent).index(p_elem)
+        original_pPr = p_elem.find(f'{{{W}}}pPr')
+
+        # Agrupa runs em segmentos separados por <w:br/> ou por início de bullet
+        segments = []
+        current_runs = []
+
+        for elem in p_elem:
+            tag = elem.tag.split('}')[1] if '}' in elem.tag else elem.tag
+
+            if tag == 'pPr':
+                continue
+
+            if tag == 'r':
+                br = elem.find(f'{{{W}}}br')
+                t_elem = elem.find(f'{{{W}}}t')
+                t_text = t_elem.text if t_elem is not None else ''
+
+                if br is not None:
+                    # <w:br/> → fecha segmento atual
+                    if current_runs:
+                        segments.append(current_runs)
+                    current_runs = []
+                elif t_text and '•' in t_text:
+                    # Novo bullet → pode haver múltiplos bullets no mesmo run
+                    # Separa cada bullet em seu próprio segmento
+                    parts = [p for p in t_text.split('•') if p.strip()]
+                    for i, part in enumerate(parts):
+                        if current_runs and i == 0:
+                            # Fecha segmento anterior
+                            segments.append(current_runs)
+                            current_runs = []
+                        # Cria run com este bullet
+                        new_r = deepcopy(elem)
+                        new_t = new_r.find(f'{{{W}}}t')
+                        if new_t is not None:
+                            new_t.text = '• ' + part.strip()
+                        current_runs = [new_r]
+                        if i < len(parts) - 1:
+                            segments.append(current_runs)
+                            current_runs = []
+                else:
+                    current_runs.append(deepcopy(elem))
+            else:
+                current_runs.append(deepcopy(elem))
+
+        if current_runs:
+            segments.append(current_runs)
+
+        if len(segments) <= 1:
+            continue
+
+        # Cria um parágrafo novo para cada segmento
+        new_paras = []
+        for seg_runs in segments:
+            if not any(
+                (r.find(f'{{{W}}}t') is not None and r.find(f'{{{W}}}t').text or '').strip()
+                for r in seg_runs
+            ):
+                continue
+
+            new_p = OxmlElement('w:p')
+            if original_pPr is not None:
+                new_p.append(deepcopy(original_pPr))
+            for r in seg_runs:
+                new_p.append(r)
+            new_paras.append(new_p)
+
+        if not new_paras:
+            continue
+
+        # Substitui parágrafo original pelos novos
+        parent.remove(p_elem)
+        for i, new_p in enumerate(new_paras):
+            parent.insert(insert_pos + i, new_p)
+        print(f"    → {len(new_paras)} parágrafos criados")
+
+    doc.save(docx_path)
+    print("✅ Parágrafos quebrados com sucesso")
 
 def remove_picture_border(run):
     """Remove borda que LibreOffice/Word adiciona em imagens inline"""
@@ -387,64 +497,166 @@ def add_line_to_docx(doc, x0, y0, x1, y1, page_height, page_width):
         pass  # Silencia erros
 
 
-def add_section_borders(docx_path):
-    """Adiciona bordas superiores nas seções do currículo (linhas horizontais)"""
-    try:
-        doc = Document(docx_path)
-        
-        # Palavras-chave de seções
-        section_keywords = [
-            'OBJETIVO', 'COMPETÊNCIAS', 'EXPERIÊNCIA', 'FORMAÇÃO', 
-            'CURSOS', 'HABILIDADES', 'INFORMAÇÕES', 'RESUMO', 'QUALIFICAÇÕES'
-        ]
-        
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-        
-        count = 0
-        for para in doc.paragraphs:
-            text = para.text.strip().upper()
-            if not text:
-                continue
-            
-            # Verifica se é uma seção
-            is_section = text in section_keywords or any(kw in text for kw in section_keywords)
-            
-            if is_section and count < 5:  # Limita a 5 seções
-                # Adiciona borda superior (linha horizontal)
-                p = para._p
-                pPr = p.get_or_add_pPr()
-                
-                # Cria elemento de bordas
-                pBorders = pPr.find(qn('w:pBorders'))
-                if pBorders is None:
-                    pBorders = OxmlElement('w:pBorders')
-                    pPr.append(pBorders)
-                
-                # Borda superior
-                top_border = OxmlElement('w:top')
-                top_border.set(qn('w:val'), 'single')
-                top_border.set(qn('w:sz'), '6')  # 6/8 = 0.75pt
-                top_border.set(qn('w:space'), '1')
-                top_border.set(qn('w:color'), '000000')
-                pBorders.append(top_border)
-                
-                count += 1
-                print(f"   ✅ Borda adicionada em: '{text[:30]}'")
-        
-        if count > 0:
-            doc.save(docx_path)
-            print(f"✅ {count} bordas de seção adicionadas")
-        else:
-            print("📏 Nenhuma seção encontrada para bordas")
-            
-    except Exception as e:
-        print(f"Erro ao adicionar bordas: {e}")
-        import traceback
-        traceback.print_exc()
-        import traceback
-        traceback.print_exc()
+def add_section_borders(docx_path, pdf_path):
+    from collections import defaultdict
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
 
+    # 1. Extrai linhas gráficas reais do PDF
+    doc_pdf = fitz.open(pdf_path)
+    pdf_lines = []  # lista de {"page", "y", "width"}
+
+    for page_num, page in enumerate(doc_pdf):
+        page_height = page.rect.height
+        for shape in page.get_drawings():
+            rect = shape.get("rect", None)
+            if rect and abs(rect.width) > 100 and abs(rect.height) < 3:
+                pdf_lines.append({
+                    "page": page_num,
+                    "y": round(rect.y0, 1),
+                    "page_height": page_height
+                })
+
+    # Agrupa linhas duplicadas (linhas duplas próximas viram uma)
+    grouped = []
+    for line in sorted(pdf_lines, key=lambda l: (l["page"], l["y"])):
+        if grouped and grouped[-1]["page"] == line["page"] and abs(line["y"] - grouped[-1]["y"]) < 5:
+            # média do Y do par de linhas duplas
+            grouped[-1]["y"] = round((grouped[-1]["y"] + line["y"]) / 2, 1)
+        else:
+            grouped.append(dict(line))
+
+    if not grouped:
+        print("📏 PDF sem linhas horizontais, pulando bordas")
+        doc_pdf.close()
+        return
+
+    # Detecta se são linhas duplas
+    raw_ys = [round(l["y"]) for l in pdf_lines]
+    is_double = any(
+        abs(sorted(set(raw_ys))[i+1] - sorted(set(raw_ys))[i]) < 5
+        for i in range(len(sorted(set(raw_ys))) - 1)
+    )
+    border_style = "double" if is_double else "single"
+    print(f"📏 Estilo: {border_style} | {len(grouped)} linhas encontradas")
+
+    # 2. Para cada linha, acha o parágrafo acima e abaixo no PDF
+    #    e calcula a proporção (onde a linha está entre os dois)
+    border_targets = []
+
+    for line in grouped:
+        page = doc_pdf[line["page"]]
+        all_spans = []
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] != 0:
+                continue
+            for pdf_line in block["lines"]:
+                for span in pdf_line["spans"]:
+                    text = span["text"].strip()
+                    if text:
+                        all_spans.append({
+                            "text": text,
+                            "y_top": round(span["bbox"][1], 1),    # topo do texto
+                            "y_bot": round(span["bbox"][3], 1),    # base do texto
+                            "size": round(span["size"], 1),
+                        })
+
+        line_y = line["y"]
+
+        # Parágrafo cujo FUNDO (y_bot) está acima da linha
+        above = [s for s in all_spans if s["y_bot"] < line_y]
+        # Parágrafo cujo TOPO (y_top) está abaixo da linha
+        below = [s for s in all_spans if s["y_top"] > line_y]
+
+        if not above or not below:
+            continue
+
+        para_above = max(above, key=lambda s: s["y_bot"])
+        para_below = min(below, key=lambda s: s["y_top"])
+
+        # Distância real entre o fundo do parágrafo acima e o topo do parágrafo abaixo
+        gap_total   = para_below["y_top"] - para_above["y_bot"]  # espaço total entre os dois
+        dist_above  = line_y - para_above["y_bot"]               # linha → fundo do parágrafo acima
+        dist_below  = para_below["y_top"] - line_y               # linha → topo do parágrafo abaixo
+
+        # Proporção: 0.0 = colada acima, 1.0 = colada abaixo, 0.5 = centralizada
+        ratio = dist_above / gap_total if gap_total > 0 else 0.5
+
+        # Decide onde ancorar baseado na fonte (título tem size maior)
+        if para_below["size"] >= para_above["size"]:
+            anchor = "top"           # borda superior do parágrafo abaixo
+            anchor_text = para_below["text"].upper()[:40]
+            # space = distância do topo do título até a linha (em pontos)
+            space_pt = round(dist_below)
+        else:
+            anchor = "bottom"        # borda inferior do parágrafo acima
+            anchor_text = para_above["text"].upper()[:40]
+            space_pt = round(dist_above)
+
+        # Word usa unidades de 1/8 pt para w:space em bordas de parágrafo
+        # Máximo permitido é 31 (= ~4pt). Normaliza para esse range.
+        space_val = min(31, max(1, round(space_pt / 2)))
+
+        border_targets.append({
+            "anchor": anchor,
+            "text": anchor_text,
+            "space": str(space_val),
+            "ratio": round(ratio, 2),
+            "dist_above_pt": round(dist_above, 1),
+            "dist_below_pt": round(dist_below, 1),
+        })
+        print(f"📏 Y={line_y} | gap={round(gap_total)}pt | acima={round(dist_above)}pt abaixo={round(dist_below)}pt ratio={round(ratio,2)} → {anchor} em '{anchor_text[:25]}' space={space_val}")
+
+    doc_pdf.close()
+
+    # 3. Aplica no DOCX
+    doc = Document(docx_path)
+    applied = set()
+
+    for para in doc.paragraphs:
+        text = para.text.strip().upper()
+        if not text:
+            continue
+
+        for target in border_targets:
+            match_text = target["text"][:20]
+            if not match_text or match_text in applied:
+                continue
+            if not text.startswith(match_text):
+                continue
+
+            p = para._p
+            pPr = p.get_or_add_pPr()
+
+            # Remove borda existente
+            existing = pPr.find(qn('w:pBorders'))
+            if existing is not None:
+                pPr.remove(existing)
+
+            # Adiciona borda com espaçamento proporcional ao PDF
+            pBorders = OxmlElement('w:pBorders')
+            border_el = OxmlElement(
+                'w:bottom' if target["anchor"] == "bottom" else 'w:top'
+            )
+            border_el.set(qn('w:val'), border_style)
+            border_el.set(qn('w:sz'), '6')
+            border_el.set(qn('w:space'), target["space"])
+            border_el.set(qn('w:color'), '000000')
+            pBorders.append(border_el)
+            pPr.append(pBorders)
+
+            # Ajusta space_before/after do parágrafo para replicar o gap do PDF
+            if target["anchor"] == "top":
+                para.paragraph_format.space_before = Pt(target["dist_above_pt"])
+            else:
+                para.paragraph_format.space_after = Pt(target["dist_below_pt"])
+
+            applied.add(match_text)
+            print(f"   ✅ '{target['anchor']}' em '{text[:30]}' | space_before/after={target['dist_above_pt' if target['anchor'] == 'top' else 'dist_below_pt']}pt")
+            break
+
+    doc.save(docx_path)
+    print(f"✅ {len(applied)} bordas adicionadas")
 
 def fix_title_size(docx_path, doc_info):
     """Usa o tamanho de título extraído do PDF pelo analyzer"""
@@ -470,6 +682,13 @@ def fix_title_size(docx_path, doc_info):
 def convert_pdf_pdf2docx(pdf_path, docx_path):
     """Converte PDF para DOCX mantendo formatação"""
     print(f"🎯 Convertendo via pdf2docx: {pdf_path}")
+    cv = Converter(pdf_path)
+    cv.convert(docx_path, start=0, end=None)
+    cv.close()
+
+    # ✅ Primeira coisa: quebra parágrafos agrupados
+    print("✂️ Quebrando parágrafos agrupados...")
+    split_merged_paragraphs(docx_path)
 
 
     # ✅ Analisa o PDF para pegar tamanhos reais
@@ -498,7 +717,7 @@ def convert_pdf_pdf2docx(pdf_path, docx_path):
     
     # Adiciona bordas nas seções (linhas horizontais)
     print("📏 Adicionando bordas nas seções...")
-    add_section_borders(docx_path)
+    add_section_borders(docx_path, pdf_path)
     print("🔤 Ajustando tamanho do título...")
     fix_title_size(docx_path, doc_info)
 
